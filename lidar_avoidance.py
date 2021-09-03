@@ -4,38 +4,66 @@ import rospy
 import cv2
 import cv_bridge
 import numpy
+import math
 from sensor_msgs.msg import Image
 from sensor_msgs.msg import LaserScan
 from geometry_msgs.msg import Twist
 
 global perr, ptime, serr, dt, move, ray_angle
-perr = 1
+perr = 0
 ptime = 0
 serr = 0
-dt = 1
+dt = 0
 move = False
-angle_step_deg = 20 
+angle_step_deg = 20
 
 
 class Follower:
 	def __init__(self):
 		self.bridge = cv_bridge.CvBridge()
 		self.image_sub = rospy.Subscriber('/usb_cam/image_raw',	Image, self.image_callback)
-		self.lidar_sub = rospy.Subscriber('/laser_raw', LaserScan, self.lidar_callback)
+		self.lidar_sub = rospy.Subscriber('/scan_raw', LaserScan, self.lidar_callback)
 		self.cmd_vel_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=1)
 		self.image_pub = rospy.Publisher('/lane_image', Image, queue_size=1)
 		self.twist = Twist()
 		self.ray_angle = [x for x in range(angle_step_deg, 180, angle_step_deg)]
+		self.dists = None
 
 		self.cmd_vel_pub.publish(self.twist)
 
 	def lidar_callback(self, msg):
 		# get lidar distance at ray_angle in degree
-		self.dists = [msg.ranges[x] for x in self.ray_angle]
+		# dynamic offset
+		# angles = [(x - 90) % 360 for x in self.ray_angle]
+		# self.dists = [msg.ranges[x*2] for x in angles]
+		# self.dists = list(map(lambda x: 0.1 if x == float('inf') else x, self.dists))
+		# self.dists = list(map(lambda x: 0.5 if x >= 0.5 else x, self.dists))
+
+		# static offset
+		angles = [x for x in range(-10, -90, -5)]
+		self.dists = [msg.ranges[x*2] for x in angles]
 
 	def get_obstacle_threshold(self):
-		return sum([dist * numpy.cos(theta) for dist, theta in zip(self.dists, self.ray_angle)])
-		
+		if self.dists == None:
+			return 0
+
+		# dynamic offset
+		# lateral_dists = [dist * numpy.cos(numpy.deg2rad(theta)) for dist, theta in zip(self.dists, self.ray_angle)]
+
+		# static offset
+		lateral_count = 0
+		for d in self.dists:
+			if d < 0.5:
+				lateral_count += 1
+		if lateral_count >= 1:
+			print("lateral_cnt :{}".format(lateral_count))
+			return 120
+		else:
+			return 0
+
+		# dynamic offset
+		# return sum(lateral_dists)
+
 	def image_callback(self, msg):
 		global perr, ptime, serr, dt
 		image0 = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
@@ -45,14 +73,12 @@ class Follower:
 						 interpolation=cv2.INTER_CUBIC)
 		#print img.shape
 		rows, cols, ch = img.shape
-		pts1 = numpy.float32([[150, 150], [115, 200], [288, 150], [335, 200]])
-		#pts2 = numpy.float32([[50,50],[50,450],[450,50],[450,450]])
-		#pts2 = numpy.float32([[10,10],[10,490],[490,10],[490,490]])
-		pts2 = numpy.float32([[100, 100], [100, 400], [400, 100], [400, 400]])
+		pts1 = numpy.float32([[30, 80], [20, 130], [160, 80], [170, 130]])
+		pts2 = numpy.float32([[0, 0], [0, 300], [300, 0], [300, 300]])
 
 		M = cv2.getPerspectiveTransform(pts1, pts2)
 		img_size = (img.shape[1], img.shape[0])
-		image = cv2.warpPerspective(img, M, (500, 500))  # img_size
+		image = cv2.warpPerspective(img, M, (300, 300))  # img_size
 
 		hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
 		gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -101,8 +127,8 @@ class Follower:
 		# ROI
 		out_img = rgb_yb2.copy()
 		h, w = out_img.shape
-		search_top = int(2*h/4+20)
-		search_bot = int(4*h/4+20)
+		search_top = int(1*h/4+20)
+		search_bot = int(3*h/4+20)
 		search_mid = int(w/2)
 		out_img[0:search_top, 0:w] = 0
 		out_img[search_bot:h, 0:w] = 0
@@ -116,8 +142,8 @@ class Follower:
 			# cx = cxm - 110 #120#143 #CW
 			#cx = cxm - 150
 			offset = self.get_obstacle_threshold()
-			print(offset)
-			cx = cxm - offset 
+			#print("offset: ", offset)
+			cx = cxm - offset
 
 			cv2.circle(out_img, (cxm, cym), 20, (255, 0, 0), -1)
 			cv2.circle(out_img, (cx, cym), 20, (255, 0, 0), 2)
@@ -132,7 +158,7 @@ class Follower:
 		#   self.twist.angular.z = (-float(err) / 100)*2.5 + ((err - perr)/(rospy.get_time() - ptime))*1/50/100 #+ (serr*dt)*1/20/100 #1 is best, starting 3 unstable
 		#   ang_z = err*0.0028
 			# + (serr*dt)*1/20/100 #1 is best, starting 3 unstable
-			ang_z = (float(err) / 100)*(0.15) + \
+			ang_z = (float(err) / 100)*(0.25) + \
 				((err - perr)/(rospy.get_time() - ptime))*1/20/100
 			ang_z = min(0.8, max(-0.8, ang_z))
 		# 0.143
@@ -146,8 +172,8 @@ class Follower:
 			self.twist.angular.z = -ang_z
 
 		#   print(cx, err*0.02, ang_z)
-			print("cx:{}, err:{:.4f}, ang_z:{:4f}, lin_x:{:4f}".format(
-				cx, err*0.0015, ang_z, lin_x))
+			# print("cx:{}, err:{:.4f}, ang_z:{:4f}, lin_x:{:4f}".format(
+			#	cx, err*0.0015, ang_z, lin_x))
 			serr = err + serr
 			perr = err
 			ptime = rospy.get_time()
